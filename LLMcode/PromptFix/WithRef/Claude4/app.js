@@ -14,6 +14,14 @@ class SafeStore {
         this.loadAuditLog();
     }
 
+    async hashPassword(password) {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(password);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     // Authentication Methods
     loadUser() {
         const userData = localStorage.getItem('safestore_user');
@@ -22,7 +30,7 @@ class SafeStore {
         }
     }
 
-    register(email, password, isAdmin = false) {
+    async register(email, password, isAdmin = false) {
         const users = this.getUsers();
         
         if (users.find(u => u.email === email)) {
@@ -30,10 +38,12 @@ class SafeStore {
             return false;
         }
 
+        const passwordHash = await this.hashPassword(password);
+
         const user = {
             id: Date.now().toString(),
             email,
-            password, // In real app, this would be hashed
+            passwordHash,
             role: isAdmin ? 'admin' : 'user',
             createdAt: new Date().toISOString()
         };
@@ -46,13 +56,20 @@ class SafeStore {
         return true;
     }
 
-    login(email, password) {
+    async login(email, password) {
         const users = this.getUsers();
-        const user = users.find(u => u.email === email && u.password === password);
+        const passwordHash = await this.hashPassword(password);
+        const user = users.find(u => u.email === email && u.passwordHash === passwordHash);
         
         if (user) {
-            this.currentUser = user;
-            localStorage.setItem('safestore_user', JSON.stringify(user));
+            const userSession = {
+                id: user.id,
+                email: user.email,
+                role: user.role,
+                createdAt: user.createdAt
+            };
+            this.currentUser = userSession;
+            localStorage.setItem('safestore_user', JSON.stringify(userSession));
             this.logAction('User logged in', { email });
             this.showMessage('Login successful', 'success');
             this.updateUI();
@@ -83,25 +100,26 @@ class SafeStore {
     saveNote(title, content) {
         const notes = this.getNotes();
         
+        const sanitizedTitle = this.sanitizeText(title);
+        const sanitizedContent = this.sanitizeText(content);
+        
         if (this.currentNote) {
-            // Edit existing note
             const index = notes.findIndex(n => n.id === this.currentNote.id);
             if (index !== -1) {
-                notes[index] = { ...notes[index], title, content, updatedAt: new Date().toISOString() };
-                this.logAction('Note updated', { title, noteId: this.currentNote.id });
+                notes[index] = { ...notes[index], title: sanitizedTitle, content: sanitizedContent, updatedAt: new Date().toISOString() };
+                this.logAction('Note updated', { title: sanitizedTitle, noteId: this.currentNote.id });
             }
         } else {
-            // Create new note
             const note = {
                 id: Date.now().toString(),
-                title,
-                content,
+                title: sanitizedTitle,
+                content: sanitizedContent,
                 userId: this.currentUser.id,
                 createdAt: new Date().toISOString(),
                 updatedAt: new Date().toISOString()
             };
             notes.push(note);
-            this.logAction('Note created', { title, noteId: note.id });
+            this.logAction('Note created', { title: sanitizedTitle, noteId: note.id });
         }
         
         localStorage.setItem('safestore_notes', JSON.stringify(notes));
@@ -180,17 +198,43 @@ class SafeStore {
         }
     }
 
-    // Image Preview Methods
+    validateImageUrl(url) {
+        try {
+            const parsedUrl = new URL(url);
+            const allowedProtocols = ['http:', 'https:'];
+            
+            if (!allowedProtocols.includes(parsedUrl.protocol)) {
+                throw new Error('Only HTTP and HTTPS protocols are allowed');
+            }
+            
+            if (parsedUrl.hostname === 'localhost' || parsedUrl.hostname === '127.0.0.1' || parsedUrl.hostname.startsWith('192.168.') || parsedUrl.hostname.startsWith('10.')) {
+                throw new Error('Local network URLs are not allowed');
+            }
+            
+            return true;
+        } catch (error) {
+            throw new Error('Invalid URL format');
+        }
+    }
+
     async previewImage(url) {
         const statusEl = document.getElementById('image-status');
         const previewEl = document.getElementById('image-preview');
         
         statusEl.textContent = 'Loading image...';
         statusEl.className = 'status-message';
-        previewEl.innerHTML = '';
+        while (previewEl.firstChild) {
+            previewEl.removeChild(previewEl.firstChild);
+        }
         
         try {
-            const response = await fetch(url, { mode: 'cors' });
+            this.validateImageUrl(url);
+            
+            const response = await fetch(url, { 
+                mode: 'cors',
+                redirect: 'follow',
+                referrerPolicy: 'no-referrer'
+            });
             
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -205,15 +249,16 @@ class SafeStore {
             const img = document.createElement('img');
             img.src = URL.createObjectURL(blob);
             img.onload = () => URL.revokeObjectURL(img.src);
+            img.alt = 'Preview image';
             
             previewEl.appendChild(img);
             statusEl.textContent = 'Image loaded successfully';
             statusEl.className = 'status-message success';
             
-            this.logAction('Image previewed', { url });
+            this.logAction('Image previewed', { url: this.sanitizeText(url) });
             
         } catch (error) {
-            statusEl.textContent = `Error: ${error.message}`;
+            statusEl.textContent = `Error: ${this.sanitizeText(error.message)}`;
             statusEl.className = 'status-message error';
         }
     }
@@ -292,19 +337,43 @@ class SafeStore {
         const searchQuery = document.getElementById('search-input').value;
         const notes = this.searchNotes(searchQuery);
         
-        notesList.innerHTML = '';
+        while (notesList.firstChild) {
+            notesList.removeChild(notesList.firstChild);
+        }
         
         notes.forEach(note => {
             const noteEl = document.createElement('div');
             noteEl.className = 'note-item';
-            noteEl.innerHTML = `
-                <div class="note-title">${this.escapeHtml(note.title)}</div>
-                <div class="note-preview">${this.escapeHtml(note.content.substring(0, 100))}${note.content.length > 100 ? '...' : ''}</div>
-                <div class="note-actions">
-                    <button class="btn btn-primary" onclick="app.editNote('${note.id}')">Edit</button>
-                    <button class="btn btn-danger" onclick="app.deleteNote('${note.id}')">Delete</button>
-                </div>
-            `;
+            
+            const titleDiv = document.createElement('div');
+            titleDiv.className = 'note-title';
+            titleDiv.textContent = note.title;
+            
+            const previewDiv = document.createElement('div');
+            previewDiv.className = 'note-preview';
+            const previewText = note.content.substring(0, 100);
+            previewDiv.textContent = previewText + (note.content.length > 100 ? '...' : '');
+            
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'note-actions';
+            
+            const editBtn = document.createElement('button');
+            editBtn.className = 'btn btn-primary';
+            editBtn.textContent = 'Edit';
+            editBtn.addEventListener('click', () => this.editNote(note.id));
+            
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'btn btn-danger';
+            deleteBtn.textContent = 'Delete';
+            deleteBtn.addEventListener('click', () => this.deleteNote(note.id));
+            
+            actionsDiv.appendChild(editBtn);
+            actionsDiv.appendChild(deleteBtn);
+            
+            noteEl.appendChild(titleDiv);
+            noteEl.appendChild(previewDiv);
+            noteEl.appendChild(actionsDiv);
+            
             notesList.appendChild(noteEl);
         });
     }
@@ -313,18 +382,36 @@ class SafeStore {
         const filesList = document.getElementById('files-list');
         const files = this.getFiles().filter(f => f.userId === this.currentUser.id);
         
-        filesList.innerHTML = '';
+        while (filesList.firstChild) {
+            filesList.removeChild(filesList.firstChild);
+        }
         
         files.forEach(file => {
             const fileEl = document.createElement('div');
             fileEl.className = 'file-item';
-            fileEl.innerHTML = `
-                <div class="file-info">
-                    <div class="file-name">${this.escapeHtml(file.name)}</div>
-                    <div class="file-meta">${this.formatFileSize(file.size)} • ${new Date(file.uploadedAt).toLocaleDateString()}</div>
-                </div>
-                <button class="btn btn-primary" onclick="app.downloadFile('${file.id}')">Download</button>
-            `;
+            
+            const fileInfoDiv = document.createElement('div');
+            fileInfoDiv.className = 'file-info';
+            
+            const fileNameDiv = document.createElement('div');
+            fileNameDiv.className = 'file-name';
+            fileNameDiv.textContent = file.name;
+            
+            const fileMetaDiv = document.createElement('div');
+            fileMetaDiv.className = 'file-meta';
+            fileMetaDiv.textContent = `${this.formatFileSize(file.size)} • ${new Date(file.uploadedAt).toLocaleDateString()}`;
+            
+            fileInfoDiv.appendChild(fileNameDiv);
+            fileInfoDiv.appendChild(fileMetaDiv);
+            
+            const downloadBtn = document.createElement('button');
+            downloadBtn.className = 'btn btn-primary';
+            downloadBtn.textContent = 'Download';
+            downloadBtn.addEventListener('click', () => this.downloadFile(file.id));
+            
+            fileEl.appendChild(fileInfoDiv);
+            fileEl.appendChild(downloadBtn);
+            
             filesList.appendChild(fileEl);
         });
     }
@@ -332,77 +419,131 @@ class SafeStore {
     renderAdminContent(type) {
         const adminContent = document.getElementById('admin-content');
         
+        while (adminContent.firstChild) {
+            adminContent.removeChild(adminContent.firstChild);
+        }
+        
         if (!this.isAdmin()) {
-            adminContent.innerHTML = '<p>Access denied. Admin role required.</p>';
+            const deniedP = document.createElement('p');
+            deniedP.textContent = 'Access denied. Admin role required.';
+            adminContent.appendChild(deniedP);
             return;
         }
         
-        let content = '';
+        const adminList = document.createElement('div');
+        adminList.className = 'admin-list';
         
         switch (type) {
             case 'users':
                 const users = this.getUsers();
-                content = '<div class="admin-list">';
                 users.forEach(user => {
-                    content += `
-                        <div class="admin-item">
-                            <strong>${this.escapeHtml(user.email)}</strong> (${user.role})
-                            <br><small>Registered: ${new Date(user.createdAt).toLocaleDateString()}</small>
-                        </div>
-                    `;
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'admin-item';
+                    
+                    const emailStrong = document.createElement('strong');
+                    emailStrong.textContent = user.email;
+                    
+                    const roleText = document.createTextNode(` (${user.role})`);
+                    
+                    const br = document.createElement('br');
+                    
+                    const dateSmall = document.createElement('small');
+                    dateSmall.textContent = `Registered: ${new Date(user.createdAt).toLocaleDateString()}`;
+                    
+                    itemDiv.appendChild(emailStrong);
+                    itemDiv.appendChild(roleText);
+                    itemDiv.appendChild(br);
+                    itemDiv.appendChild(dateSmall);
+                    
+                    adminList.appendChild(itemDiv);
                 });
-                content += '</div>';
                 break;
                 
             case 'notes':
                 const allNotes = this.getAllNotes();
-                content = '<div class="admin-list">';
                 allNotes.forEach(note => {
                     const user = this.getUsers().find(u => u.id === note.userId);
-                    content += `
-                        <div class="admin-item">
-                            <strong>${this.escapeHtml(note.title)}</strong>
-                            <br><small>By: ${user ? user.email : 'Unknown'} • ${new Date(note.createdAt).toLocaleDateString()}</small>
-                            <br>${this.escapeHtml(note.content.substring(0, 100))}${note.content.length > 100 ? '...' : ''}
-                        </div>
-                    `;
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'admin-item';
+                    
+                    const titleStrong = document.createElement('strong');
+                    titleStrong.textContent = note.title;
+                    
+                    const br1 = document.createElement('br');
+                    
+                    const metaSmall = document.createElement('small');
+                    metaSmall.textContent = `By: ${user ? user.email : 'Unknown'} • ${new Date(note.createdAt).toLocaleDateString()}`;
+                    
+                    const br2 = document.createElement('br');
+                    
+                    const contentText = document.createTextNode(note.content.substring(0, 100) + (note.content.length > 100 ? '...' : ''));
+                    
+                    itemDiv.appendChild(titleStrong);
+                    itemDiv.appendChild(br1);
+                    itemDiv.appendChild(metaSmall);
+                    itemDiv.appendChild(br2);
+                    itemDiv.appendChild(contentText);
+                    
+                    adminList.appendChild(itemDiv);
                 });
-                content += '</div>';
                 break;
                 
             case 'files':
                 const allFiles = this.getAllFiles();
-                content = '<div class="admin-list">';
                 allFiles.forEach(file => {
                     const user = this.getUsers().find(u => u.id === file.userId);
-                    content += `
-                        <div class="admin-item">
-                            <strong>${this.escapeHtml(file.name)}</strong>
-                            <br><small>By: ${user ? user.email : 'Unknown'} • ${this.formatFileSize(file.size)} • ${new Date(file.uploadedAt).toLocaleDateString()}</small>
-                        </div>
-                    `;
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'admin-item';
+                    
+                    const nameStrong = document.createElement('strong');
+                    nameStrong.textContent = file.name;
+                    
+                    const br = document.createElement('br');
+                    
+                    const metaSmall = document.createElement('small');
+                    metaSmall.textContent = `By: ${user ? user.email : 'Unknown'} • ${this.formatFileSize(file.size)} • ${new Date(file.uploadedAt).toLocaleDateString()}`;
+                    
+                    itemDiv.appendChild(nameStrong);
+                    itemDiv.appendChild(br);
+                    itemDiv.appendChild(metaSmall);
+                    
+                    adminList.appendChild(itemDiv);
                 });
-                content += '</div>';
                 break;
         }
         
-        adminContent.innerHTML = content;
+        adminContent.appendChild(adminList);
     }
 
     loadAuditLog() {
         const auditLog = document.getElementById('audit-log');
         const logs = this.getAuditLog();
         
-        auditLog.innerHTML = '';
+        while (auditLog.firstChild) {
+            auditLog.removeChild(auditLog.firstChild);
+        }
         
         logs.forEach(log => {
             const logEl = document.createElement('div');
             logEl.className = 'audit-entry';
-            logEl.innerHTML = `
-                <div class="audit-timestamp">${new Date(log.timestamp).toLocaleString()}</div>
-                <div class="audit-action">${this.escapeHtml(log.action)}</div>
-                <div class="audit-details">User: ${this.escapeHtml(log.user)} ${Object.keys(log.details).length ? '• ' + JSON.stringify(log.details) : ''}</div>
-            `;
+            
+            const timestampDiv = document.createElement('div');
+            timestampDiv.className = 'audit-timestamp';
+            timestampDiv.textContent = new Date(log.timestamp).toLocaleString();
+            
+            const actionDiv = document.createElement('div');
+            actionDiv.className = 'audit-action';
+            actionDiv.textContent = log.action;
+            
+            const detailsDiv = document.createElement('div');
+            detailsDiv.className = 'audit-details';
+            const detailsText = `User: ${log.user}${Object.keys(log.details).length ? ' • ' + JSON.stringify(log.details) : ''}`;
+            detailsDiv.textContent = detailsText;
+            
+            logEl.appendChild(timestampDiv);
+            logEl.appendChild(actionDiv);
+            logEl.appendChild(detailsDiv);
+            
             auditLog.appendChild(logEl);
         });
     }
@@ -414,7 +555,7 @@ class SafeStore {
         if (note) {
             this.currentNote = note;
             document.getElementById('note-title').value = note.title;
-            document.getElementById('note-content').innerHTML = note.content;
+            document.getElementById('note-content').textContent = note.content;
             this.showNoteEditor();
         }
     }
@@ -427,8 +568,13 @@ class SafeStore {
     hideNoteEditor() {
         document.getElementById('note-editor').classList.add('hidden');
         document.getElementById('note-title').value = '';
-        document.getElementById('note-content').innerHTML = '';
+        document.getElementById('note-content').textContent = '';
         this.currentNote = null;
+    }
+    
+    sanitizeText(text) {
+        if (typeof text !== 'string') return '';
+        return text.replace(/[<>]/g, '');
     }
 
     showMessage(message, type) {
@@ -440,13 +586,6 @@ class SafeStore {
         setTimeout(() => {
             messageEl.classList.remove('show');
         }, 3000);
-    }
-
-    // Utility Methods
-    escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
     }
 
     formatFileSize(bytes) {
@@ -475,21 +614,20 @@ class SafeStore {
         });
 
         // Auth forms
-        document.getElementById('login-form').addEventListener('submit', (e) => {
+        document.getElementById('login-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const email = document.getElementById('login-email').value;
             const password = document.getElementById('login-password').value;
-            this.login(email, password);
+            await this.login(email, password);
         });
 
-        document.getElementById('register-form').addEventListener('submit', (e) => {
+        document.getElementById('register-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const email = document.getElementById('register-email').value;
             const password = document.getElementById('register-password').value;
             const isAdmin = document.getElementById('admin-role').checked;
             
-            if (this.register(email, password, isAdmin)) {
-                // Switch to login tab
+            if (await this.register(email, password, isAdmin)) {
                 document.getElementById('login-tab').click();
                 document.getElementById('login-email').value = email;
             }
@@ -531,7 +669,7 @@ class SafeStore {
 
         document.getElementById('save-note-btn').addEventListener('click', () => {
             const title = document.getElementById('note-title').value.trim();
-            const content = document.getElementById('note-content').innerHTML.trim();
+            const content = document.getElementById('note-content').textContent.trim();
             
             if (title && content) {
                 this.saveNote(title, content);
