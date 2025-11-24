@@ -4,6 +4,7 @@
  * admin panel, and audit log. All data persists in localStorage.
  */
 (() => {
+  'use strict';
   // --- Storage keys
   const K = {
     users: 'safestore_users',
@@ -12,6 +13,7 @@
     session: 'safestore_session',
     audit: 'safestore_audit'
   };
+  Object.freeze(K);
 
   // --- DOM elements
   const el = {
@@ -59,14 +61,71 @@
 
   // --- In-memory state
   let selectedNoteId = null;
+  let lastObjectURLs = [];
 
   // --- Utilities
   const read = (k, d=[]) => {
     try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; }
   };
   const write = (k, v) => localStorage.setItem(k, JSON.stringify(v));
-  const uuid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const uuid = () => {
+    const b = new Uint8Array(16); crypto.getRandomValues(b);
+    b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+    const h = [...b].map(v => v.toString(16).padStart(2,'0')).join('');
+    return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+  };
   const nowISO = () => new Date().toISOString();
+
+  async function hashPassword(p) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(p||''));
+    return [...new Uint8Array(buf)].map(v=>v.toString(16).padStart(2,'0')).join('');
+  }
+
+  function isValidEmail(email) {
+    const e = (email||'').trim().toLowerCase();
+    return e.includes('@') && e.length <= 254;
+  }
+  function isStrongPassword(p) { return (p||'').length >= 8; }
+
+  function isSafeUrl(url) {
+    try { const u = new URL(url); return u.protocol === 'https:' && !u.username && !u.password; } catch { return false; }
+  }
+
+  function sanitizeHTML(input='') {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(input, 'text/html');
+    const allowed = new Set(['b','i','strong','em','u','p','br','ol','ul','li','code','pre','blockquote','a','span']);
+    const allowedAttrs = { a: ['href'] };
+    function clean(n) {
+      if (n.nodeType === Node.TEXT_NODE) return document.createTextNode(n.textContent);
+      if (n.nodeType !== Node.ELEMENT_NODE) return document.createTextNode('');
+      const tag = n.tagName.toLowerCase();
+      if (!allowed.has(tag)) return document.createTextNode('');
+      const el2 = document.createElement(tag);
+      for (const attr of [...n.attributes]) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith('on') || name === 'style') continue;
+        if (tag === 'a' && name === 'href') {
+          const href = attr.value.trim();
+          if (isSafeHref(href)) {
+            el2.setAttribute('href', href);
+            el2.setAttribute('rel','noopener noreferrer');
+            el2.setAttribute('target','_blank');
+          }
+          continue;
+        }
+        if ((allowedAttrs[tag]||[]).includes(name)) el2.setAttribute(name, attr.value);
+      }
+      for (const child of [...n.childNodes]) el2.appendChild(clean(child));
+      return el2;
+    }
+    function isSafeHref(href) {
+      try { const u = new URL(href, 'https://example.com'); const ok = ['http:','https:'].includes(u.protocol) || href.startsWith('#') || href.startsWith('mailto:'); return ok; } catch { return href.startsWith('#'); }
+    }
+    const tmp = document.createElement('div');
+    for (const c of [...doc.body.childNodes]) tmp.appendChild(clean(c));
+    return tmp.innerHTML;
+  }
 
   // --- Audit logging
   function logAudit(action, details) {
@@ -77,7 +136,18 @@
   }
   function renderAudit() {
     const a = read(K.audit, []);
-    el.auditLogList.innerHTML = a.map(x => `<li><strong>${x.action}</strong> <span class="meta">${x.time}</span><br>${escapeHTML(shorten(JSON.stringify(x.details)))}</li>`).join('');
+    const ul = el.auditLogList; ul.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const x of a) {
+      const li = document.createElement('li');
+      const s1 = document.createElement('strong'); s1.textContent = x.action;
+      const meta = document.createElement('span'); meta.className = 'meta'; meta.textContent = x.time;
+      const br = document.createElement('br');
+      const d = document.createElement('span'); d.textContent = shorten(JSON.stringify(x.details));
+      li.appendChild(s1); li.appendChild(meta); li.appendChild(br); li.appendChild(d);
+      frag.appendChild(li);
+    }
+    ul.appendChild(frag);
   }
 
   // --- Auth
@@ -85,19 +155,31 @@
   function setUsers(all) { write(K.users, all); }
   function findUserByEmail(email) { return usersAll().find(u => u.email === email); }
 
-  function register(email, password, role) {
-    email = email.trim().toLowerCase();
-    if (!email || !password) return msg(el.authMsg, 'Email and password required', true);
+  async function register(email, password, role) {
+    email = (email||'').trim().toLowerCase();
+    if (!isValidEmail(email) || !isStrongPassword(password)) return msg(el.authMsg, 'Invalid email or weak password (min 8 chars)', true);
     if (findUserByEmail(email)) return msg(el.authMsg, 'User already exists', true);
-    const user = { id: uuid(), email, password, role: role === 'admin' ? 'admin' : 'user', createdAt: nowISO() };
+    const passwordHash = await hashPassword(password);
+    const user = { id: uuid(), email, passwordHash, role: role === 'admin' ? 'admin' : 'user', createdAt: nowISO() };
     const all = usersAll(); all.push(user); setUsers(all);
     msg(el.authMsg, 'Registered. Please login.', false);
     logAudit('register', { email, role: user.role });
   }
 
-  function login(email, password) {
+  async function login(email, password) {
     const u = findUserByEmail((email||'').trim().toLowerCase());
-    if (!u || u.password !== password) return msg(el.authMsg, 'Invalid credentials', true);
+    if (!u) return msg(el.authMsg, 'Invalid credentials', true);
+    const passwordHash = await hashPassword(password||'');
+    if (u.passwordHash !== passwordHash) {
+      if (u.password && u.password === (password||'')) {
+        u.passwordHash = await hashPassword(u.password);
+        delete u.password;
+        const all = usersAll().map(x => x.id === u.id ? u : x); setUsers(all);
+        logAudit('password_migrated', { email: u.email });
+      } else {
+        return msg(el.authMsg, 'Invalid credentials', true);
+      }
+    }
     const token = { token: uuid(), userId: u.id, email: u.email, role: u.role, createdAt: nowISO() };
     write(K.session, token);
     logAudit('login', { email: u.email, role: u.role });
@@ -125,7 +207,7 @@
   function saveCurrentNote() {
     const s = session(); if (!s) return;
     const title = el.noteTitleInput.value.trim();
-    const contentHtml = el.noteContentEditable.innerHTML.trim();
+    const contentHtml = sanitizeHTML(el.noteContentEditable.innerHTML.trim());
     if (!title && !contentHtml) return msg(el.noteMsg, 'Nothing to save', true);
     let all = notesAll();
     if (!selectedNoteId) {
@@ -154,13 +236,23 @@
   function renderNotesList() {
     const s = session(); if (!s) return;
     const q = (el.noteSearchInput.value||'').toLowerCase();
-    const list = notesByUser(s.userId).filter(n => !q || n.title.toLowerCase().includes(q) || (n.contentHtml||'').toLowerCase().includes(q));
-    el.notesList.innerHTML = list.map(n => `<li data-id="${n.id}"><span>${escapeHTML(n.title||'(untitled)')}</span><span class="meta">${n.updatedAt}</span></li>`).join('');
-    [...el.notesList.querySelectorAll('li')].forEach(li => li.addEventListener('click', () => {
-      const id = li.getAttribute('data-id'); const n = getNote(id); if (!n) return;
-      selectedNoteId = id; el.noteTitleInput.value = n.title || '';
-      el.noteContentEditable.innerHTML = n.contentHtml || '';
-    }));
+    const list = notesByUser(s.userId).filter(n => !q || (n.title||'').toLowerCase().includes(q) || (n.contentHtml||'').toLowerCase().includes(q));
+    const ul = el.notesList; ul.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const n of list) {
+      const li = document.createElement('li');
+      li.dataset.id = n.id;
+      const t = document.createElement('span'); t.textContent = n.title || '(untitled)';
+      const meta = document.createElement('span'); meta.className = 'meta'; meta.textContent = n.updatedAt;
+      li.appendChild(t); li.appendChild(meta);
+      li.addEventListener('click', () => {
+        const id = li.dataset.id; const nn = getNote(id); if (!nn) return;
+        selectedNoteId = id; el.noteTitleInput.value = nn.title || '';
+        el.noteContentEditable.innerHTML = sanitizeHTML(nn.contentHtml || '');
+      });
+      frag.appendChild(li);
+    }
+    ul.appendChild(frag);
   }
 
   // --- Files (metadata + dataURL)
@@ -197,16 +289,28 @@
   }
   function renderFiles() {
     const s = session(); if (!s) return;
+    for (const u of lastObjectURLs) try { URL.revokeObjectURL(u); } catch {}
+    lastObjectURLs = [];
     const list = filesByUser(s.userId);
-    el.fileList.innerHTML = list.map(f => {
+    const ul = el.fileList; ul.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const f of list) {
+      const li = document.createElement('li');
+      const name = document.createElement('span'); name.textContent = f.name;
+      const meta = document.createElement('span'); meta.className = 'meta'; meta.textContent = `${f.type||'unknown'} · ${fmtBytes(f.size)} · ${f.savedAt}`;
       const blob = dataURLToBlob(f.dataUrl);
-      const url = URL.createObjectURL(blob);
-      return `<li><span>${escapeHTML(f.name)}</span><span class="meta">${f.type||'unknown'} · ${fmtBytes(f.size)} · ${f.savedAt}</span> <a href="${url}" download="${escapeAttr(f.name)}">Download</a></li>`;
-    }).join('');
+      const url = URL.createObjectURL(blob); lastObjectURLs.push(url);
+      const a = document.createElement('a'); a.href = url; a.download = escapeAttr(f.name);
+      a.textContent = 'Download';
+      li.appendChild(name); li.appendChild(meta); li.appendChild(a);
+      frag.appendChild(li);
+    }
+    ul.appendChild(frag);
   }
 
   // --- Remote image preview via fetch()
   async function previewRemoteImage(url) {
+    if (!isSafeUrl(url)) { el.imageFetchStatus.textContent = 'Enter a valid https:// URL'; logAudit('image_preview', { url, ok: false, error: 'invalid_url' }); return; }
     el.imageFetchStatus.textContent = 'Loading...';
     el.imagePreview.removeAttribute('src');
     const img = el.imagePreview;
@@ -235,6 +339,7 @@
       const res = await fetch(url, { mode: 'cors' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
+      if (!String(blob.type||'').startsWith('image/')) throw new Error('not_image');
       const obj = URL.createObjectURL(blob);
       el.imagePreview.src = obj;
       el.imageFetchStatus.textContent = 'Loaded (blob)';
@@ -250,9 +355,15 @@
     const allUsers = usersAll();
     const allNotes = notesAll();
     const allFiles = filesAll();
-    el.adminUsersList.innerHTML = allUsers.map(u => `<li><span>${escapeHTML(u.email)}</span><span class="meta">${u.role} · ${u.createdAt}</span></li>`).join('');
-    el.adminNotesList.innerHTML = allNotes.map(n => `<li><span>${escapeHTML(n.title||'(untitled)')}</span><span class="meta">owner:${ownerEmail(n.ownerId)} · ${n.updatedAt}</span></li>`).join('');
-    el.adminFilesList.innerHTML = allFiles.map(f => `<li><span>${escapeHTML(f.name)}</span><span class="meta">owner:${ownerEmail(f.ownerId)} · ${f.type} · ${fmtBytes(f.size)}</span></li>`).join('');
+    const uUl = el.adminUsersList; uUl.textContent='';
+    const nUl = el.adminNotesList; nUl.textContent='';
+    const fUl = el.adminFilesList; fUl.textContent='';
+    const uf = document.createDocumentFragment();
+    for (const u of allUsers) { const li=document.createElement('li'); const s1=document.createElement('span'); s1.textContent=u.email; const meta=document.createElement('span'); meta.className='meta'; meta.textContent=`${u.role} · ${u.createdAt}`; li.appendChild(s1); li.appendChild(meta); uf.appendChild(li);} uUl.appendChild(uf);
+    const nf = document.createDocumentFragment();
+    for (const n of allNotes) { const li=document.createElement('li'); const s1=document.createElement('span'); s1.textContent=n.title||'(untitled)'; const meta=document.createElement('span'); meta.className='meta'; meta.textContent=`owner:${ownerEmail(n.ownerId)} · ${n.updatedAt}`; li.appendChild(s1); li.appendChild(meta); nf.appendChild(li);} nUl.appendChild(nf);
+    const ff = document.createDocumentFragment();
+    for (const f of allFiles) { const li=document.createElement('li'); const s1=document.createElement('span'); s1.textContent=f.name; const meta=document.createElement('span'); meta.className='meta'; meta.textContent=`owner:${ownerEmail(f.ownerId)} · ${f.type} · ${fmtBytes(f.size)}`; li.appendChild(s1); li.appendChild(meta); ff.appendChild(li);} fUl.appendChild(ff);
   }
   function ownerEmail(uid) { return usersAll().find(u => u.id === uid)?.email || 'unknown'; }
 
@@ -290,8 +401,8 @@
 
   // --- Event bindings
   function bindEvents() {
-    el.registerForm.addEventListener('submit', (e) => { e.preventDefault(); register(el.regEmail.value, el.regPassword.value, el.regRole.value); });
-    el.loginForm.addEventListener('submit', (e) => { e.preventDefault(); login(el.loginEmail.value, el.loginPassword.value); });
+    el.registerForm.addEventListener('submit', async (e) => { e.preventDefault(); await register(el.regEmail.value, el.regPassword.value, el.regRole.value); });
+    el.loginForm.addEventListener('submit', async (e) => { e.preventDefault(); await login(el.loginEmail.value, el.loginPassword.value); });
     el.logoutBtn.addEventListener('click', logout);
 
     el.noteSearchInput.addEventListener('input', renderNotesList);

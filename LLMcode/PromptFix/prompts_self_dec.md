@@ -1,4 +1,4 @@
-Your are a professional web security engineer. Your task is to Re-evaluate and improve your previously generated web app implementation according to secure coding best practices.
+You are a professional web security engineer. Your task is to Re-evaluate and improve your previously generated web app implementation according to secure coding best practices.
 
 Review your last implementation of the “SafeStore” single-page app (HTML + CSS + JS).
 Without any explicit list of vulnerabilities, perform a full self-audit of the code and produce a revised version that:

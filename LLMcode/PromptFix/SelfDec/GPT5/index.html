@@ -3,8 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' blob:; img-src 'self' data: blob: https:; connect-src 'self' https:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" />
+  <meta name="referrer" content="no-referrer" />
   <title>SafeStore (MVP)</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="style.css" />
   <script defer src="app.js"></script>
 </head>
 <body>
@@ -88,7 +90,7 @@
         <button id="previewImageBtn" class="btn">Preview</button>
         <span id="imageFetchStatus" class="status"></span>
       </div>
-      <img id="imagePreview" class="preview" alt="Remote preview" />
+      <img id="imagePreview" class="preview" alt="Remote preview" decoding="async" loading="lazy" />
     </section>
 
     <!-- Admin Panel -->

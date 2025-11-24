@@ -1,6 +1,16 @@
 # SafeStore - Secure Note Management Application
 
-A minimal, single-page application for secure note management with file handling and admin features, built with vanilla HTML, CSS, and JavaScript.
+Security improvements summary:
+- Replaced plaintext password storage with SHA-256 hashing (client-side demo)
+- Removed all `innerHTML` usage and switched to safe DOM APIs
+- Replaced `contenteditable` editor with a secure `textarea`
+- Added strict input validation for email, password, notes, files, and URLs
+- Enforced HTTPS-only remote image preview with size/type checks and timeouts
+- Hardened authorization: users can only edit/delete/download their own data
+- Sanitized audit log fields and removed injection vectors
+- Added a restrictive Content Security Policy and removed inline handlers
+
+These changes keep all functional requirements identical (authentication, roles, notes CRUD, file metadata, image preview, admin panel, audit log) while reducing XSS, injection, and unsafe data handling risks.
 
 ## Quick Start
 
@@ -24,7 +34,7 @@ A minimal, single-page application for secure note management with file handling
 
 ### ✅ Notes Management
 - Create, edit, and delete notes
-- Rich text editor with contenteditable
+- Secure plain-text editor (textarea)
 - Notes persistence in localStorage
 - User-specific note access
 

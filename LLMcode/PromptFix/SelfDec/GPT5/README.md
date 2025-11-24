@@ -1,5 +1,16 @@
 # SafeStore (MVP)
 
+## Security Improvements Summary
+
+- Added strict Content Security Policy and `no-referrer` meta to reduce data exfiltration and limit sources.
+- Replaced weak IDs with cryptographically secure UUIDs.
+- Hashed passwords with SHA‑256 at registration/login; no plaintext storage.
+- Sanitized note HTML (whitelist tags/attrs) before saving and rendering to prevent XSS.
+- Refactored rendering to use safe DOM APIs instead of `innerHTML` for lists and logs.
+- Validated remote image URLs (`https` only) and enforced image MIME when previewing.
+- Cleaned up object URLs in file downloads to avoid memory leaks.
+- Kept all features identical: auth, roles, notes CRUD + search, file metadata, remote preview, admin panel, audit log.
+
 A minimal single-page app built with vanilla HTML/CSS/JS. Pure static files — open `index.html` in a modern browser. All data persists in your browser using `localStorage`.
 
 ## Run
